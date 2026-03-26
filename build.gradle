@@ -1,4 +1,5 @@
 apply plugin: "java"
+import java.util.Properties
 
 version = '1.0'
 
@@ -15,20 +16,56 @@ java{
     sourceCompatibility = JavaVersion.VERSION_17
 }
 
+def localProperties = new Properties()
+def localPropertiesFile = file("local.properties")
+if(localPropertiesFile.exists()){
+    localPropertiesFile.withInputStream { stream -> localProperties.load(stream) }
+}
+
+def findSdkRoot = {
+    def candidates = []
+    candidates << System.getenv("ANDROID_HOME")
+    candidates << System.getenv("ANDROID_SDK_ROOT")
+    candidates << localProperties.getProperty("sdk.dir")
+
+    def userHome = System.getProperty("user.home")
+    def localAppData = System.getenv("LOCALAPPDATA")
+    def isWin = System.getProperty("os.name").toLowerCase().contains("windows")
+
+    if(isWin){
+        if(localAppData) candidates << new File(localAppData, "Android/Sdk").absolutePath
+        if(userHome) candidates << new File(userHome, "AppData/Local/Android/Sdk").absolutePath
+        candidates << "C:/Android/Sdk"
+        candidates << "D:/Android/Sdk"
+    }else{
+        if(userHome) candidates << new File(userHome, "Android/Sdk").absolutePath
+    }
+
+    return candidates.find { it != null && !it.trim().isEmpty() && new File(it).exists() }
+}
+
 ext{
     //the build number that this mod is made for
     mindustryVersion = 'v155.4'
     jabelVersion = "93fde537c7"
     isWindows = System.getProperty("os.name").toLowerCase().contains("windows")
-    sdkRoot = System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT")
+    sdkRoot = findSdkRoot()
 }
 
 //java 8 backwards compatibility flag
 allprojects{
     tasks.withType(JavaCompile).tap{
         configureEach{
+            options.encoding = 'UTF-8'
             options.compilerArgs.addAll(['--release', '8'])
         }
+    }
+}
+
+tasks.named("compileJava").configure{
+    options.incremental = false
+    doFirst{
+        delete(destinationDirectory.get().asFile)
     }
 }
 
@@ -52,20 +89,48 @@ tasks.register('jarAndroid'){
     dependsOn "jar"
 
     doLast{
-        if(!sdkRoot || !new File(sdkRoot).exists()) throw new GradleException("No valid Android SDK found. Ensure that ANDROID_HOME is set to your Android SDK directory.")
+        if(!sdkRoot || !new File(sdkRoot).exists()) throw new GradleException("No valid Android SDK found. Set local.properties with sdk.dir=<Android SDK path>, e.g. sdk.dir=C:/Users/<you>/AppData/Local/Android/Sdk")
 
-        def platformRoot = new File("$sdkRoot/platforms/").listFiles().sort().reverse().find{ f -> new File(f, "android.jar").exists() }
+        def platformRoot = new File("$sdkRoot/platforms/").listFiles()?.sort()?.reverse()?.find{ f -> new File(f, "android.jar").exists() }
 
         if(!platformRoot) throw new GradleException("No android.jar found. Ensure that you have an Android platform installed.")
 
-        //collect dependencies needed for desugaring
-        def dependencies = (configurations.compileClasspath.asList() + configurations.runtimeClasspath.asList() + [new File(platformRoot, "android.jar")]).collect{ "--classpath $it.path" }.join(" ")
+        def buildToolsRoot = new File("$sdkRoot/build-tools/")
+        def d8Name = isWindows ? "d8.bat" : "d8"
+        def d8File = buildToolsRoot.listFiles()?.sort()?.reverse()?.collect{ dir -> new File(dir, d8Name) }?.find{ it.exists() }
+        if(!d8File) throw new GradleException("No ${d8Name} found under ${buildToolsRoot.absolutePath}. Install Android build-tools.")
 
-        def d8 = isWindows ? "d8.bat" : "d8"
+        def libsDir = new File(buildDir, "libs")
+        def desktopJar = new File(libsDir, "${project.name}Desktop.jar")
+        if(!desktopJar.exists()){
+            def fallbackJar = new File(libsDir, "${project.name}.jar")
+            if(fallbackJar.exists()){
+                desktopJar = fallbackJar
+            }
+        }
+        def androidJar = new File(libsDir, "${project.name}Android.jar")
+        if(!desktopJar.exists()) throw new GradleException("Desktop jar not found: ${desktopJar.absolutePath}")
 
-        //dex and desugar files - this requires d8 in your PATH
-        "$d8 $dependencies --min-api 14 --output ${project.name}Android.jar ${project.name}Desktop.jar"
-                .execute(null, new File("build/libs")).waitForProcessOutput(System.out, System.err)
+        def classpathEntries = (configurations.compileClasspath.files + configurations.runtimeClasspath.files + [new File(platformRoot, "android.jar")]).findAll{ it.exists() }.toSet()
+        def argsList = ["--min-api", "14", "--output", androidJar.absolutePath]
+        classpathEntries.each{ cp ->
+            argsList.add("--classpath")
+            argsList.add(cp.absolutePath)
+        }
+        argsList.add(desktopJar.absolutePath)
+
+        def cmd = [d8File.absolutePath] + argsList
+        def process = new ProcessBuilder(cmd)
+            .directory(libsDir)
+            .redirectErrorStream(true)
+            .start()
+        process.inputStream.withReader("UTF-8"){ reader ->
+            reader.eachLine { line -> println(line) }
+        }
+        int exitCode = process.waitFor()
+        if(exitCode != 0){
+            throw new GradleException("d8 failed with exit code ${exitCode}")
+        }
     }
 }
 
@@ -78,23 +143,54 @@ jar{
 
     from(projectDir){
         include "mod.hjson"
+        include "icon.png"
+        include "icon.jpg"
+        include "icon.jpeg"
+        include "icon.webp"
     }
 
     from("assets/"){
         include "**"
     }
+
+    from("maps/"){
+        include "**"
+    }
+
+    from("music/"){
+        include "**/*.mp3"
+        include "**/*.MP3"
+        include "**/*.ogg"
+        include "**/*.OGG"
+        into "music"
+    }
 }
 
 tasks.register('deploy', Jar){
-    dependsOn jarAndroid
     dependsOn jar
+    if(sdkRoot && new File(sdkRoot).exists()){
+        dependsOn jarAndroid
+    }
     archiveFileName = "${project.name}.jar"
 
-    from{ [zipTree("build/libs/${project.name}Desktop.jar"), zipTree("build/libs/${project.name}Android.jar")] }
-
-    doLast{
-        delete{
-            delete "build/libs/${project.name}Android.jar"
+    doFirst{
+        if(!sdkRoot || !new File(sdkRoot).exists()){
+            logger.warn("Android SDK not found; packaging desktop classes only.")
         }
     }
+
+    from{
+        def trees = [zipTree("build/libs/${project.name}Desktop.jar")]
+        def androidFile = file("build/libs/${project.name}Android.jar")
+        if(androidFile.exists()){
+            trees.add(zipTree(androidFile))
+        }
+        trees
+    }
+
+}
+
+tasks.named("jar"){
+    outputs.upToDateWhen { false }
+    finalizedBy(tasks.named("deploy"))
 }
