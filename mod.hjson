@@ -5,13 +5,13 @@ displayName: "FantaLory"
 name: "FantaLory"
 
 #your name
-author: "姬宮華戀"
+author: "Himemiya Karen"
 
 #the fully qualified main class of the mod
 main: "FantaLory.AzFantaLory"
 
 #the mod description as seen in the mod dialog
-description: "欢迎来到塔洛莉."
+description: "A fantasy magic expansion for Mindustry with Talory progression, custom resources, spell combat, and immersive music/UI systems."
 
 #the mod version
 version: 0.21
